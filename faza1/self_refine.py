@@ -2,6 +2,7 @@
 """
 SIR Projekat — Faza 2
 Self-Refine petlja za prevod sa Skill Persistence
+v2 — popravke iz prvog runa
 Balsam server | Flavio & Claude | Mart 2026
 """
 
@@ -25,6 +26,13 @@ PROCEDURE_ID    = 1
 MAX_ITERATIONS  = 3
 CONV_THRESHOLD  = 0.02
 
+# Mapiranje lang koda u pun naziv za prompt
+LANG_NAMES = {
+    "srp": "Serbian",
+    "hrv": "Croatian",
+    "bos": "Bosnian"
+}
+
 # ── Timing helper ──────────────────────────────────────────────────────────────
 def timer():
     return time.time()
@@ -41,11 +49,20 @@ def psql(query):
     return result.stdout.strip()
 
 # ── Ollama helpers ─────────────────────────────────────────────────────────────
-def translate(text, model=TRANSLATE_MODEL, critique=""):
-    prompt = "Translate the following text accurately and naturally."
+def translate(text, target_lang, model=TRANSLATE_MODEL, critique=""):
+    """
+    POPRAVKA v2: eksplicitni target_lang i striktna instrukcija
+    da se vrati SAMO prevod bez meta-komentara.
+    """
+    prompt = (
+        f"Translate the following text into {target_lang}.\n"
+        f"Return ONLY the translation. No explanations, no comments, "
+        f"no repetition of the original. Just the translated text.\n"
+    )
     if critique:
-        prompt += f"\n\nPrevious attempt had these issues: {critique}\nPlease improve."
-    prompt += f"\n\nText: {text}\n\nTranslation:"
+        prompt += f"Silently apply this feedback: {critique}\n"
+    prompt += f"\nText: {text}\n\nTranslation:"
+
     t = timer()
     resp = requests.post(f"{OLLAMA_URL}/generate", json={
         "model": model, "prompt": prompt, "stream": False,
@@ -70,14 +87,15 @@ def cosine_similarity(v1, v2):
     n2   = sum(b*b for b in v2)**0.5
     return dot/(n1*n2) if n1 and n2 else 0.0
 
-def self_critique(original, translation, reference, similarity):
-    prompt = f"""Evaluate this translation briefly.
-Original: {original}
-Translation: {translation}
-Reference: {reference}
-Score: {similarity:.3f}/1.0
-
-List 1-2 specific issues and suggest improvements. Be concise."""
+def self_critique(original, translation, reference, similarity, target_lang):
+    prompt = (
+        f"Evaluate this {target_lang} translation briefly.\n"
+        f"Original (English): {original}\n"
+        f"Translation: {translation}\n"
+        f"Reference {target_lang}: {reference}\n"
+        f"Quality score: {similarity:.3f}/1.0\n\n"
+        f"List 1-2 specific issues and suggest improvements. Be concise."
+    )
     t = timer()
     resp = requests.post(f"{OLLAMA_URL}/generate", json={
         "model": CRITIQUE_MODEL, "prompt": prompt, "stream": False,
@@ -107,8 +125,10 @@ def save_metadata(session_id, lang, metric, value, details=None):
 # ── Self-Refine petlja ─────────────────────────────────────────────────────────
 def self_refine(original, reference, lang, direction, session_id):
     t_total = timer()
+    target_lang = LANG_NAMES.get(lang, lang)
+
     print(f"\n{'─'*60}")
-    print(f"  {lang} | {direction}")
+    print(f"  {lang} ({target_lang}) | {direction}")
     print(f"  Orig: {original[:70]}")
     print(f"  Ref:  {reference[:70]}")
 
@@ -120,23 +140,24 @@ def self_refine(original, reference, lang, direction, session_id):
     for i in range(1, MAX_ITERATIONS + 1):
         t_iter = timer()
         print(f"\n  [Iter {i}]")
-        translation = translate(original, critique=critique)
+
+        translation = translate(original, target_lang, critique=critique)
         print(f"  → {translation[:80]}")
 
         t_emb = get_embedding(translation)
         sim   = cosine_similarity(t_emb, ref_emb)
         delta = sim - prev_sim
-        print(f"  Similarity: {sim:.4f}  Δ{delta:+.4f}  [{elapsed(t_iter)}]")
+        print(f"  Similarity: {sim:.4f}  Δ{delta:+.4f}  [iter ukupno: {elapsed(t_iter)}]")
 
         step = {"iteration": i, "translation": translation,
-                "similarity": round(sim,6), "delta": round(delta,6)}
+                "similarity": round(sim, 6), "delta": round(delta, 6)}
 
         if i < MAX_ITERATIONS:
             if abs(delta) < CONV_THRESHOLD and i > 1:
                 print(f"  Konvergencija — zaustavljam.")
                 steps_log.append(step)
                 break
-            critique = self_critique(original, translation, reference, sim)
+            critique = self_critique(original, translation, reference, sim, target_lang)
             print(f"  Kritika: {critique[:100]}")
             step["critique"] = critique
 
@@ -167,16 +188,16 @@ def get_samples(lang, n=2):
     for line in rows.split('\n'):
         line = line.strip()
         if '|' in line:
-            p = [x.strip() for x in line.split('|')]
-            if len(p) >= 2 and p[0] and p[1]:
-                samples.append((p[0], p[1]))
+            parts = [x.strip() for x in line.split('|')]
+            if len(parts) >= 2 and parts[0] and parts[1]:
+                samples.append((parts[0], parts[1]))
     return samples
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     t_session = timer()
     session_id = f"sir_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    print(f"\nSIR Self-Refine | Sesija: {session_id}")
+    print(f"\nSIR Self-Refine v2 | Sesija: {session_id}")
     print(f"Model: {TRANSLATE_MODEL} | Kritika: {CRITIQUE_MODEL} | Emb: {EMBED_MODEL}")
     print(f"Max iteracija: {MAX_ITERATIONS} | Konvergencija: {CONV_THRESHOLD}")
 
@@ -200,14 +221,14 @@ if __name__ == "__main__":
             save_metadata(session_id, lang, "avg_delta_similarity", avg_delta,
                          {"n": len(lr), "avg_final": avg_final})
 
-    # Finalni izveštaj
+    # Finalni izvestaj
     print(f"\n{'='*60}")
     print(f"  SESIJA: {session_id}")
     print(f"  Trajektorija: {len(results)}")
     ok = sum(1 for r in results if r["success"])
-    print(f"  Uspešnih: {ok}/{len(results)}")
+    print(f"  Uspesnih: {ok}/{len(results)}")
     if results:
-        avg = sum(r["delta"] for r in results)/len(results)
-        print(f"  Prosečno Δsimilarity: {avg:+.4f}")
+        avg = sum(r["delta"] for r in results) / len(results)
+        print(f"  Prosecno delta similarity: {avg:+.4f}")
     print(f"  Ukupno vreme sesije: {elapsed(t_session)}")
     print(f"{'='*60}")
