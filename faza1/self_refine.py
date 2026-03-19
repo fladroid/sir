@@ -9,6 +9,7 @@ import json
 import subprocess
 import requests
 import os
+import time
 from datetime import datetime
 
 # ── Konfiguracija ──────────────────────────────────────────────────────────────
@@ -24,6 +25,13 @@ PROCEDURE_ID    = 1
 MAX_ITERATIONS  = 3
 CONV_THRESHOLD  = 0.02
 
+# ── Timing helper ──────────────────────────────────────────────────────────────
+def timer():
+    return time.time()
+
+def elapsed(start):
+    return f"{time.time() - start:.1f}s"
+
 # ── DB helper ──────────────────────────────────────────────────────────────────
 def psql(query):
     cmd = ["docker", "exec", "pgdb",
@@ -38,16 +46,20 @@ def translate(text, model=TRANSLATE_MODEL, critique=""):
     if critique:
         prompt += f"\n\nPrevious attempt had these issues: {critique}\nPlease improve."
     prompt += f"\n\nText: {text}\n\nTranslation:"
+    t = timer()
     resp = requests.post(f"{OLLAMA_URL}/generate", json={
         "model": model, "prompt": prompt, "stream": False,
         "options": {"temperature": 0.3}
     }, timeout=180)
+    print(f"    [translate {elapsed(t)}]")
     return resp.json().get("response", "").strip()
 
 def get_embedding(text, model=EMBED_MODEL):
+    t = timer()
     resp = requests.post(f"{OLLAMA_URL}/embeddings", json={
         "model": model, "prompt": text
     }, timeout=30)
+    print(f"    [embed {elapsed(t)}]")
     return resp.json().get("embedding", [])
 
 def cosine_similarity(v1, v2):
@@ -66,10 +78,12 @@ Reference: {reference}
 Score: {similarity:.3f}/1.0
 
 List 1-2 specific issues and suggest improvements. Be concise."""
+    t = timer()
     resp = requests.post(f"{OLLAMA_URL}/generate", json={
         "model": CRITIQUE_MODEL, "prompt": prompt, "stream": False,
         "options": {"temperature": 0.2}
     }, timeout=180)
+    print(f"    [critique {elapsed(t)}]")
     return resp.json().get("response", "").strip()
 
 # ── DB upis ────────────────────────────────────────────────────────────────────
@@ -92,6 +106,7 @@ def save_metadata(session_id, lang, metric, value, details=None):
 
 # ── Self-Refine petlja ─────────────────────────────────────────────────────────
 def self_refine(original, reference, lang, direction, session_id):
+    t_total = timer()
     print(f"\n{'─'*60}")
     print(f"  {lang} | {direction}")
     print(f"  Orig: {original[:70]}")
@@ -103,6 +118,7 @@ def self_refine(original, reference, lang, direction, session_id):
     prev_sim   = 0.0
 
     for i in range(1, MAX_ITERATIONS + 1):
+        t_iter = timer()
         print(f"\n  [Iter {i}]")
         translation = translate(original, critique=critique)
         print(f"  → {translation[:80]}")
@@ -110,7 +126,7 @@ def self_refine(original, reference, lang, direction, session_id):
         t_emb = get_embedding(translation)
         sim   = cosine_similarity(t_emb, ref_emb)
         delta = sim - prev_sim
-        print(f"  Similarity: {sim:.4f}  Δ{delta:+.4f}")
+        print(f"  Similarity: {sim:.4f}  Δ{delta:+.4f}  [{elapsed(t_iter)}]")
 
         step = {"iteration": i, "translation": translation,
                 "similarity": round(sim,6), "delta": round(delta,6)}
@@ -131,10 +147,12 @@ def self_refine(original, reference, lang, direction, session_id):
     baseline_sim = steps_log[0]["similarity"]
     success      = final_sim > baseline_sim
 
+    t = timer()
     traj_id = save_trajectory(lang, direction, original, len(steps_log),
                                final_sim, baseline_sim, steps_log, success)
+    print(f"  [db write {elapsed(t)}]")
     print(f"\n  Baseline {baseline_sim:.4f} → Final {final_sim:.4f}  ({final_sim-baseline_sim:+.4f})")
-    print(f"  Trajektorija ID: {traj_id}")
+    print(f"  Trajektorija ID: {traj_id}  |  Ukupno: {elapsed(t_total)}")
 
     return {"traj_id": traj_id, "lang": lang, "direction": direction,
             "iterations": len(steps_log), "baseline": baseline_sim,
@@ -156,9 +174,11 @@ def get_samples(lang, n=2):
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    t_session = timer()
     session_id = f"sir_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     print(f"\nSIR Self-Refine | Sesija: {session_id}")
     print(f"Model: {TRANSLATE_MODEL} | Kritika: {CRITIQUE_MODEL} | Emb: {EMBED_MODEL}")
+    print(f"Max iteracija: {MAX_ITERATIONS} | Konvergencija: {CONV_THRESHOLD}")
 
     results = []
 
@@ -180,7 +200,7 @@ if __name__ == "__main__":
             save_metadata(session_id, lang, "avg_delta_similarity", avg_delta,
                          {"n": len(lr), "avg_final": avg_final})
 
-    # Izveštaj
+    # Finalni izveštaj
     print(f"\n{'='*60}")
     print(f"  SESIJA: {session_id}")
     print(f"  Trajektorija: {len(results)}")
@@ -189,4 +209,5 @@ if __name__ == "__main__":
     if results:
         avg = sum(r["delta"] for r in results)/len(results)
         print(f"  Prosečno Δsimilarity: {avg:+.4f}")
+    print(f"  Ukupno vreme sesije: {elapsed(t_session)}")
     print(f"{'='*60}")
