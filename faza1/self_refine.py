@@ -14,7 +14,8 @@ import time
 from datetime import datetime
 
 # ── Konfiguracija ──────────────────────────────────────────────────────────────
-OLLAMA_URL      = "http://localhost:11434/api"
+OLLAMA_URL      = "http://localhost:11434/api"   # embeddings ostaju ovdje
+LLAMA_INF_URL   = "http://localhost:8088/v1"     # inference → llama-server
 TRANSLATE_MODEL = "balsam:latest"
 CRITIQUE_MODEL  = "balsam:latest"
 EMBED_MODEL     = "llama3.2:3b"
@@ -64,12 +65,14 @@ def translate(text, target_lang, model=TRANSLATE_MODEL, critique=""):
     prompt += f"\nText: {text}\n\nTranslation:"
 
     t = timer()
-    resp = requests.post(f"{OLLAMA_URL}/generate", json={
-        "model": model, "prompt": prompt, "stream": False,
-        "options": {"temperature": 0.3}
+    resp = requests.post(f"{LLAMA_INF_URL}/chat/completions", json={
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "temperature": 0.3
     }, timeout=180)
     print(f"    [translate {elapsed(t)}]")
-    return resp.json().get("response", "").strip()
+    return resp.json()["choices"][0]["message"]["content"].strip()
 
 def get_embedding(text, model=EMBED_MODEL):
     t = timer()
@@ -97,12 +100,14 @@ def self_critique(original, translation, reference, similarity, target_lang):
         f"List 1-2 specific issues and suggest improvements. Be concise."
     )
     t = timer()
-    resp = requests.post(f"{OLLAMA_URL}/generate", json={
-        "model": CRITIQUE_MODEL, "prompt": prompt, "stream": False,
-        "options": {"temperature": 0.2}
+    resp = requests.post(f"{LLAMA_INF_URL}/chat/completions", json={
+        "model": CRITIQUE_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "temperature": 0.2
     }, timeout=180)
     print(f"    [critique {elapsed(t)}]")
-    return resp.json().get("response", "").strip()
+    return resp.json()["choices"][0]["message"]["content"].strip()
 
 # ── DB upis ────────────────────────────────────────────────────────────────────
 def save_trajectory(lang, direction, original, iterations, final_sim, baseline_sim, steps_log, success):

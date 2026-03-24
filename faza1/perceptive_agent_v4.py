@@ -31,6 +31,7 @@ def psql(q):
 def llm_chat(sys_msg, usr_msg, timeout=90):
     r = requests.post(f"{OLLAMA_URL}/api/chat", stream=False, timeout=timeout, json={
         "model": PLAN_MODEL,
+        "stream": False,
         "messages": [{"role":"system","content":sys_msg},{"role":"user","content":usr_msg}]
     })
     r.raise_for_status()
