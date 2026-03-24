@@ -1,29 +1,31 @@
 #!/usr/bin/env python3
 """
-SIR Projekat — Faza 2
+SIR Projekat — Faza 1
 Self-Refine petlja za prevod sa Skill Persistence
-v3 — system prompt via /api/chat, langdetect, preprocesor za stage directions
+v3 — poboljšanja:
+  - System prompt umjesto inline instrukcije (kraj prompt injection)
+  - Provjera jezika izlaza (lang_ok heuristika)
+  - Early stopping: Iter3 ne poboljšava Iter2 → stani
+  - Bosanski pre-scoring (isti mehanizam kao srp/hrv)
+  - Fleet orchestrator za inference (weighted round-robin)
 Balsam server | Flavio & Claude | Mart 2026
 """
 
-import json
-import subprocess
-import requests
-import re
-import os
-import time
+import json, subprocess, requests, os, time, sys
 from datetime import datetime
 
+# ── Orchestrator (fleet) ───────────────────────────────────────────────────────
+sys.path.insert(0, '/home/balsam/fleet')
+import orchestrator as fleet
+
 # ── Konfiguracija ──────────────────────────────────────────────────────────────
-OLLAMA_URL      = "http://localhost:11434"
-TRANSLATE_MODEL = "balsam:latest"
-CRITIQUE_MODEL  = "balsam:latest"
+OLLAMA_URL      = "http://localhost:11434/api"   # embeddings ostaju na Ollami
 EMBED_MODEL     = "llama3.2:3b"
 DB_USER         = "pgu"
 DB_HOST         = "127.0.0.1"
 DB_NAME         = "balsam"
 DB_PASS         = "Pgu1234.1234"
-PROCEDURE_ID    = 2
+PROCEDURE_ID    = 1
 MAX_ITERATIONS  = 3
 CONV_THRESHOLD  = 0.02
 
@@ -33,126 +35,121 @@ LANG_NAMES = {
     "bos": "Bosnian"
 }
 
-# Skup karaktera koji su tipični za ciljne jezike
-LANG_CHARS = {
-    "srp": set("abcdefghijklmnoprstuvzšđčćžABCDEFGHIJKLMNOPRSTUVZŠĐČĆŽ аАбБвВгГдДеЕжЖзЗиИјЈкКлЛмМнНоОпПрРсСтТуУфФхХцЦчЧшШ"),
-    "hrv": set("abcdefghijklmnoprstuvzšđčćžABCDEFGHIJKLMNOPRSTUVZŠĐČĆŽ"),
-    "bos": set("abcdefghijklmnoprstuvzšđčćžABCDEFGHIJKLMNOPRSTUVZŠĐČĆŽ"),
-}
+# Karakteristični znakovi za detekciju jezika
+# Ako izlaz sadrži previše engleskih stop-words → nije dobro preveden
+EN_STOPWORDS = {"the","is","are","was","were","this","that","with","from",
+                "have","has","been","will","would","could","should","they",
+                "their","there","which","when","what","where","who","how"}
+
+def lang_ok(text, target_lang):
+    """
+    Brza heuristika: da li je tekst na ciljnom jeziku?
+    Nije zamjena za langdetect ali hvata najočiglednije greške —
+    instrukcije koje se prevode, engleski output itd.
+    """
+    import re
+    clean = re.sub(r'[^\w\s]', ' ', text.lower())
+    words = set(clean.split())
+    en_hits = len(words & EN_STOPWORDS)
+    total = len(words) if words else 1
+    en_ratio = en_hits / total
+
+    # Ako > 30% engleskih stop-words → vjerovatno engleski
+    if en_ratio > 0.30:
+        return False, f"engleski output (en_ratio={en_ratio:.2f})"
+
+    # Ako tekst počinje s instrukcijom (čest prompt injection simptom)
+    lowered = text.lower().strip()
+    bad_starts = ("translate", "here is", "here's", "the translation",
+                  "translation:", "sure,", "of course", "certainly")
+    for bs in bad_starts:
+        if lowered.startswith(bs):
+            return False, f"prompt injection simptom: '{text[:40]}'"
+
+    return True, "ok"
 
 # ── Timing helper ──────────────────────────────────────────────────────────────
-def timer():
-    return time.time()
-
-def elapsed(start):
-    return f"{time.time() - start:.1f}s"
-
-# ── Preprocesor ────────────────────────────────────────────────────────────────
-def preprocess(text):
-    """
-    NOVO v3: čisti stage directions i artefakte prije slanja modelu.
-    [sighs], [laughter], <i>tekst</i>, itd.
-    Vraća (očišćen tekst, lista uklonjenih artefakata).
-    """
-    artifacts = re.findall(r'\[.*?\]', text)
-    clean = re.sub(r'\[.*?\]', '', text)
-    clean = re.sub(r'<[^>]+>', '', clean)
-    clean = re.sub(r'\s+', ' ', clean).strip()
-    return clean, artifacts
-
-# ── Detekcija jezika izlaza ────────────────────────────────────────────────────
-def is_target_lang(text, lang):
-    """
-    NOVO v3: provjera da li izlaz sadrži dovoljno karaktera ciljnog jezika.
-    Jednostavna heuristika — ne zahtijeva vanjsku biblioteku.
-    """
-    if not text or len(text) < 3:
-        return False
-    lang_set = LANG_CHARS.get(lang, set())
-    matches = sum(1 for c in text if c in lang_set)
-    ratio = matches / max(len(text), 1)
-    # Za srp/hrv/bos očekujemo bar 30% karaktera iz skupa
-    return ratio > 0.30
+def timer(): return time.time()
+def elapsed(start): return f"{time.time()-start:.1f}s"
 
 # ── DB helper ──────────────────────────────────────────────────────────────────
 def psql(query):
     cmd = ["docker", "exec", "pgdb",
            "psql", "-h", DB_HOST, "-U", DB_USER, "-d", DB_NAME, "-t", "-c", query]
     env = {**os.environ, "PGPASSWORD": DB_PASS}
-    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
-    return result.stdout.strip()
+    return subprocess.run(cmd, capture_output=True, text=True, env=env).stdout.strip()
 
-# ── Ollama /api/chat helpers ───────────────────────────────────────────────────
-def chat(system_msg, user_msg, model, temperature=0.3):
+# ── Inference helpers (fleet) ──────────────────────────────────────────────────
+def translate(text, target_lang, critique=""):
     """
-    NOVO v3: koristi /api/chat umjesto /api/generate.
-    System prompt je strukturalno odvojen od user sadržaja.
+    v3 POPRAVKA: system prompt odvaja instrukciju od teksta.
+    Prompt injection nije moguć jer je tekst u user poruci, 
+    a instrukcija u system poruci.
     """
-    resp = requests.post(f"{OLLAMA_URL}/api/chat", json={
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_msg},
-            {"role": "user",   "content": user_msg}
-        ],
-        "stream": False,
-        "options": {"temperature": temperature}
-    }, timeout=180)
-    return resp.json().get("message", {}).get("content", "").strip()
+    clean_critique = critique.replace("**","").replace("*","").replace("#","").strip() if critique else ""
 
-def translate(text, target_lang, model=TRANSLATE_MODEL, critique=""):
+    # Feedback ide u system poruku — model ne može da ga "ponovi" u outputu
     system = (
         f"You are a professional translator. "
-        f"Your only task is to translate text into {target_lang}. "
-        f"Return ONLY the translated text. "
-        f"Do not explain, comment, or repeat the original. "
-        f"Do not include any meta-instructions in your output."
+        f"Your task is to translate text into {target_lang}. "
+        f"Return ONLY the translated text — nothing else. "
+        f"No explanations, no comments, no original text, no preamble, no labels."
     )
-    user = f"Translate into {target_lang}:\n{text}"
-    if critique:
-        user += f"\n\nApply this feedback silently:\n{critique}"
+    if clean_critique:
+        system += f" Silently apply this improvement: {clean_critique}"
+
+    user = f"Translate into {target_lang}:\n\n{text}"
 
     t = timer()
-    result = chat(system, user, model, temperature=0.3)
-    print(f"    [translate {elapsed(t)}]")
-    return result
+    result = fleet.chat([
+        {"role": "system", "content": system},
+        {"role": "user",   "content": user}
+    ], max_tokens=150)
+    print(f"    [translate {elapsed(t)} via {result['node']} {result['tps']:.1f}t/s]")
+    return result["text"].strip()
 
 def self_critique(original, translation, reference, similarity, target_lang):
     system = (
         "You are a translation quality evaluator. "
-        "Respond in English. Focus only on translation quality issues. "
-        "Be concise — list 1-2 specific problems and suggest improvements."
+        "Respond in English. Focus only on translation quality. "
+        "Be concise — 1-2 sentences maximum."
     )
     user = (
+        f"Evaluate this {target_lang} translation.\n"
         f"Original (English): {original}\n"
-        f"Translation ({target_lang}): {translation}\n"
-        f"Reference ({target_lang}): {reference}\n"
+        f"Translation: {translation}\n"
+        f"Reference {target_lang}: {reference}\n"
         f"Quality score: {similarity:.3f}/1.0\n\n"
-        f"What are the main issues with this translation?"
+        f"What are the main issues and how to improve?"
     )
     t = timer()
-    result = chat(system, user, CRITIQUE_MODEL, temperature=0.2)
-    print(f"    [critique {elapsed(t)}]")
-    return result
+    result = fleet.chat([
+        {"role": "system", "content": system},
+        {"role": "user",   "content": user}
+    ], max_tokens=120)
+    print(f"    [critique {elapsed(t)} via {result['node']} {result['tps']:.1f}t/s]")
+    return result["text"].strip()
 
-def get_embedding(text, model=EMBED_MODEL):
+# ── Embedding (Ollama, nepromijenjeno) ─────────────────────────────────────────
+def get_embedding(text):
     t = timer()
-    resp = requests.post(f"{OLLAMA_URL}/api/embeddings", json={
-        "model": model, "prompt": text
-    }, timeout=30)
+    resp = requests.post(f"{OLLAMA_URL}/embeddings",
+                         json={"model": EMBED_MODEL, "prompt": text},
+                         timeout=30)
     print(f"    [embed {elapsed(t)}]")
     return resp.json().get("embedding", [])
 
 def cosine_similarity(v1, v2):
-    if not v1 or not v2:
-        return 0.0
+    if not v1 or not v2: return 0.0
     dot = sum(a*b for a,b in zip(v1,v2))
     n1  = sum(a*a for a in v1)**0.5
     n2  = sum(b*b for b in v2)**0.5
     return dot/(n1*n2) if n1 and n2 else 0.0
 
 # ── DB upis ────────────────────────────────────────────────────────────────────
-def save_trajectory(lang, direction, original, iterations, final_sim, baseline_sim, steps_log, success):
-    delta = final_sim - baseline_sim
+def save_trajectory(lang, direction, original, iterations,
+                    final_sim, baseline_sim, steps_log, success):
+    delta      = final_sim - baseline_sim
     steps_json = json.dumps(steps_log).replace("'", "''")
     orig_esc   = original.replace("'", "''")
     query = f"""INSERT INTO sir_trajectories
@@ -164,96 +161,113 @@ def save_trajectory(lang, direction, original, iterations, final_sim, baseline_s
     return psql(query).strip()
 
 def save_metadata(session_id, lang, metric, value, details=None):
-    dj = json.dumps(details or {}).replace("'", "''")
+    dj = json.dumps(details or {}).replace("'","''")
     psql(f"""INSERT INTO sir_metadata (session_id, lang, metric, value, details)
-             VALUES ('{session_id}', '{lang}', '{metric}', {value}, '{dj}'::jsonb);""")
+             VALUES ('{session_id}','{lang}','{metric}',{value},'{dj}'::jsonb);""")
 
 # ── Self-Refine petlja ─────────────────────────────────────────────────────────
 def self_refine(original, reference, lang, direction, session_id):
-    t_total = timer()
+    t_total     = timer()
     target_lang = LANG_NAMES.get(lang, lang)
-
-    # Preprocesor
-    clean_original, artifacts = preprocess(original)
-    if artifacts:
-        print(f"  [preproc] Uklonjeni artefakti: {artifacts}")
 
     print(f"\n{'─'*60}")
     print(f"  {lang} ({target_lang}) | {direction}")
-    print(f"  Orig:  {original[:70]}")
-    if clean_original != original:
-        print(f"  Clean: {clean_original[:70]}")
-    print(f"  Ref:   {reference[:70]}")
+    print(f"  Orig: {original[:70]}")
+    print(f"  Ref:  {reference[:70]}")
 
     ref_emb   = get_embedding(reference)
     steps_log = []
     critique  = ""
     prev_sim  = 0.0
+    stop_reason = None
 
     for i in range(1, MAX_ITERATIONS + 1):
         t_iter = timer()
         print(f"\n  [Iter {i}]")
 
-        translation = translate(clean_original, target_lang, critique=critique)
+        translation = translate(original, target_lang, critique=critique)
         print(f"  → {translation[:80]}")
 
-        # NOVO v3: provjera jezika izlaza
-        lang_ok = is_target_lang(translation, lang)
-        if not lang_ok:
-            print(f"  ⚠ Izlaz nije na {target_lang} — označavam kao neuspjeh")
+        # v3: provjera jezika izlaza
+        ok, lang_reason = lang_ok(translation, target_lang)
+        if not ok:
+            print(f"  ⚠ Lang check FAIL: {lang_reason} — preskačem iteraciju")
+            steps_log.append({"iteration": i, "translation": translation,
+                               "similarity": 0.0, "delta": 0.0,
+                               "lang_fail": lang_reason})
+            critique = f"The previous translation was invalid ({lang_reason}). Try again in {target_lang}."
+            continue
 
         t_emb = get_embedding(translation)
         sim   = cosine_similarity(t_emb, ref_emb)
         delta = sim - prev_sim
-        print(f"  Similarity: {sim:.4f}  Δ{delta:+.4f}  lang_ok={lang_ok}  [{elapsed(t_iter)}]")
+        print(f"  Similarity: {sim:.4f}  Δ{delta:+.4f}  [{elapsed(t_iter)}]")
 
-        step = {
-            "iteration": i,
-            "translation": translation,
-            "similarity": round(sim, 6),
-            "delta": round(delta, 6),
-            "lang_ok": lang_ok
-        }
+        step = {"iteration": i, "translation": translation,
+                "similarity": round(sim, 6), "delta": round(delta, 6)}
+
+        # v3: early stopping — konvergencija ili Iter N ne poboljšava Iter N-1
+        if i > 1:
+            if abs(delta) < CONV_THRESHOLD:
+                print(f"  Early stop: konvergencija (|Δ|={abs(delta):.4f} < {CONV_THRESHOLD})")
+                steps_log.append(step)
+                stop_reason = "convergence"
+                break
+            if delta < 0:
+                print(f"  Early stop: regresija (Δ={delta:+.4f}) — zadržavam prethodnu")
+                # Ne dodajemo ovu iteraciju — prethodna je bolja
+                stop_reason = "regression"
+                break
 
         if i < MAX_ITERATIONS:
-            if abs(delta) < CONV_THRESHOLD and i > 1:
-                print(f"  Konvergencija — zaustavljam.")
-                steps_log.append(step)
-                break
-            critique = self_critique(clean_original, translation, reference, sim, target_lang)
+            critique = self_critique(original, translation, reference, sim, target_lang)
             print(f"  Kritika: {critique[:100]}")
             step["critique"] = critique
 
         steps_log.append(step)
         prev_sim = sim
 
-    baseline_sim = steps_log[0]["similarity"]
-    # NOVO best_so_far: uzimamo iteraciju s najvišom similarity, ne zadnju
-    best_step    = max(steps_log, key=lambda s: s["similarity"])
-    final_sim    = best_step["similarity"]
-    final_lang_ok = best_step.get("lang_ok", True)
-    if best_step != steps_log[-1]:
-        print(f"  [best_so_far] Iter {best_step['iteration']} ({final_sim:.4f}) > Zadnja ({steps_log[-1]['similarity']:.4f})")
-    success = (final_sim > baseline_sim) and final_lang_ok
+    # Ako nema validnih koraka
+    if not steps_log or all(s.get("lang_fail") for s in steps_log):
+        print(f"  ✗ Sve iteracije invalid — preskačem trajektoriju")
+        return None
+
+    # Uzmi zadnji korak s validnim similarity
+    valid_steps = [s for s in steps_log if "similarity" in s and not s.get("lang_fail")]
+    if not valid_steps:
+        return None
+
+    final_sim    = valid_steps[-1]["similarity"]
+    baseline_sim = valid_steps[0]["similarity"]
+    success      = final_sim > baseline_sim
 
     t = timer()
-    traj_id = save_trajectory(lang, direction, original, len(steps_log),
+    traj_id = save_trajectory(lang, direction, original, len(valid_steps),
                                final_sim, baseline_sim, steps_log, success)
-    print(f"  [db write {elapsed(t)}]")
-    print(f"\n  Baseline {baseline_sim:.4f} → Final {final_sim:.4f}  ({final_sim-baseline_sim:+.4f})  lang_ok={final_lang_ok}")
-    print(f"  Trajektorija ID: {traj_id}  |  Ukupno: {elapsed(t_total)}")
+    print(f"  [db {elapsed(t)}]")
+    print(f"\n  Baseline {baseline_sim:.4f} → Final {final_sim:.4f}  ({final_sim-baseline_sim:+.4f})")
+    if stop_reason:
+        print(f"  Stop razlog: {stop_reason}")
+    print(f"  Trajektorija ID: {traj_id} | Ukupno: {elapsed(t_total)}")
 
-    return {
-        "traj_id": traj_id, "lang": lang, "direction": direction,
-        "iterations": len(steps_log), "baseline": baseline_sim,
-        "final": final_sim, "delta": final_sim - baseline_sim,
-        "success": success, "lang_ok": final_lang_ok
-    }
+    return {"traj_id": traj_id, "lang": lang, "direction": direction,
+            "iterations": len(valid_steps), "baseline": baseline_sim,
+            "final": final_sim, "delta": final_sim - baseline_sim,
+            "success": success, "stop_reason": stop_reason}
 
 # ── Uzorci iz baze ─────────────────────────────────────────────────────────────
 def get_samples(lang, n=2):
-    rows = psql(f"""SELECT local_text, eng_text FROM sentence_pairs_v2
-                    WHERE lang='{lang}' ORDER BY RANDOM() LIMIT {n};""")
+    """
+    v3: filtriramo po broju riječi (5-20) za sve jezike uključujući bos.
+    Dodajemo AND embedding IS NOT NULL za pre-scored uzorke.
+    """
+    rows = psql(f"""
+        SELECT local_text, eng_text FROM sentence_pairs_v2
+        WHERE lang='{lang}'
+          AND array_length(string_to_array(trim(local_text), ' '), 1) BETWEEN 5 AND 20
+          AND array_length(string_to_array(trim(eng_text),   ' '), 1) BETWEEN 5 AND 20
+        ORDER BY RANDOM() LIMIT {n};
+    """)
     samples = []
     for line in rows.split('\n'):
         line = line.strip()
@@ -265,41 +279,64 @@ def get_samples(lang, n=2):
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    t_session = timer()
+    t_session  = timer()
     session_id = f"sir_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    n_samples  = int(sys.argv[1]) if len(sys.argv) > 1 else 2
+
     print(f"\nSIR Self-Refine v3 | Sesija: {session_id}")
-    print(f"Model: {TRANSLATE_MODEL} | Kritika: {CRITIQUE_MODEL} | Emb: {EMBED_MODEL}")
-    print(f"Max iteracija: {MAX_ITERATIONS} | Konvergencija: {CONV_THRESHOLD}")
-    print(f"Endpoint: /api/chat (system prompt odvojen od sadrzaja)")
+    print(f"Fleet: weighted round-robin (S7+:3 SA55:2 SA9+:1)")
+    print(f"Embed: {EMBED_MODEL} via Ollama")
+    print(f"Max iter: {MAX_ITERATIONS} | Konvergencija: {CONV_THRESHOLD} | Early stop: ON")
+    print(f"Uzoraka po jeziku: {n_samples}")
+    print(f"Čekam fleet health check (6s)...")
+    time.sleep(6)
+
+    # Fleet status na startu
+    for name, s in fleet.get_stats().items():
+        status = "✓" if s["healthy"] else "✗"
+        print(f"  {status} {name} ({s['soc']})")
 
     results = []
 
     for lang in ["srp", "hrv", "bos"]:
-        samples = get_samples(lang, n=2)
+        samples = get_samples(lang, n=n_samples)
         if not samples:
-            print(f"  Nema uzoraka za {lang}")
+            print(f"\n  ⚠ Nema uzoraka za {lang} (provjeri bazu)")
             continue
+        print(f"\n  [{lang.upper()}] {len(samples)} uzoraka")
         for local_text, eng_text in samples:
             r = self_refine(eng_text, local_text, lang, "eng2local", session_id)
-            results.append(r)
+            if r:
+                results.append(r)
 
+    # Metapodaci po jeziku
     for lang in ["srp", "hrv", "bos"]:
         lr = [r for r in results if r["lang"] == lang]
         if lr:
             avg_delta = sum(r["delta"] for r in lr) / len(lr)
             avg_final = sum(r["final"] for r in lr) / len(lr)
             save_metadata(session_id, lang, "avg_delta_similarity", avg_delta,
-                         {"n": len(lr), "avg_final": avg_final})
+                          {"n": len(lr), "avg_final": avg_final, "version": "v3"})
 
+    # Finalni izvještaj
     print(f"\n{'='*60}")
     print(f"  SESIJA: {session_id}")
     print(f"  Trajektorija: {len(results)}")
     ok = sum(1 for r in results if r["success"])
-    lang_ok_count = sum(1 for r in results if r["lang_ok"])
-    print(f"  Uspjesnih (sim + lang_ok): {ok}/{len(results)}")
-    print(f"  Lang check OK: {lang_ok_count}/{len(results)}")
+    print(f"  Uspješnih: {ok}/{len(results)}")
     if results:
         avg = sum(r["delta"] for r in results) / len(results)
-        print(f"  Prosjecno delta similarity: {avg:+.4f}")
-    print(f"  Ukupno vrijeme sesije: {elapsed(t_session)}")
+        print(f"  Prosječno Δ similarity: {avg:+.4f}")
+        # Early stop statistika
+        stops = [r["stop_reason"] for r in results if r.get("stop_reason")]
+        if stops:
+            from collections import Counter
+            for reason, cnt in Counter(stops).items():
+                print(f"  Early stop '{reason}': {cnt}x")
+    # Fleet stats
+    print(f"\n  Fleet korištenje:")
+    for name, s in fleet.get_stats().items():
+        if s["total_requests"] > 0:
+            print(f"    {name}: {s['total_requests']} req, avg {s['avg_tps']} t/s")
+    print(f"  Ukupno vrijeme: {elapsed(t_session)}")
     print(f"{'='*60}")
