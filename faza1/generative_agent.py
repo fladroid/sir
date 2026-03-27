@@ -95,7 +95,7 @@ def analyse():
                COUNT(*) FILTER (WHERE delta_similarity < 0) as regresije,
                ROUND(AVG(iterations)::numeric,2) as avg_iter
         FROM sir_trajectories WHERE procedure_id=5
-        GROUP BY lang ORDER BY avg_delta_zona ASC NULLS LAST;
+        GROUP BY lang ORDER BY avg_delta ASC NULLS FIRST, avg_delta_zona ASC NULLS FIRST;
     """)
     print("Statistika (procedure_id=5, sortirano po avg_delta_zona ASC):")
     print(lang_stats)
@@ -128,36 +128,57 @@ def analyse():
 def generate(analysis_data):
     banner("FAZA 2: GENERACIJA HIPOTEZA")
 
-    system = """You are a Meta-Optimizer for a Self-Refine translation system (Serbian/Croatian/Bosnian).
-You analyse performance statistics and generate concrete improvement hypotheses.
+    # ── Programski izvuci najgori jezik iz statistike ─────────────────────────
+    # lang_stats je sortiran ASC po avg_delta_zona — prvi red = najgori jezik
+    worst_lang = "bos"  # default
+    for line in analysis_data['lang_stats'].split('\n'):
+        line = line.strip()
+        if '|' in line:
+            parts = [p.strip() for p in line.split('|')]
+            if parts[0] in ('srp', 'hrv', 'bos'):
+                worst_lang = parts[0]
+                break
+    print(f"  Najgori jezik (programski): {worst_lang.upper()}")
 
-For each hypothesis output ONE JSON object. Generate 2-3 hypotheses.
-Klasa A = parameter change (threshold, iterations, zone boundaries)
-Klasa B = prompt change (different instruction text for translate or critique)
+    system = f"""You are a Meta-Optimizer for a Self-Refine translation system.
+MANDATORY RULE: Every hypothesis MUST have \"lang_target\": \"{worst_lang}\". No exceptions.
 
-JSON format for each hypothesis:
-{
-  "klasa": "A",
-  "lang_target": "bos",
-  "hypothesis": "one sentence explaining what you think is wrong and why this fix helps",
-  "proposed_config": {
-    "param": "early_stopping_threshold",
-    "current_value": 0.02,
-    "proposed_value": 0.01,
-    "rationale": "bos has lower absolute similarity values, 0.02 causes premature stop"
-  }
-}
+Generate 2 hypotheses for language: {worst_lang}
+Klasa A = parameter change. Klasa B = prompt change.
 
-For klasa B, proposed_config must include "prompt_role" (translate|critique),
-"current_instruction" (summary), "proposed_instruction" (full new text).
-Output: JSON array of 2-3 hypothesis objects. No preamble, no markdown."""
+JSON array format (2 objects):
+[
+  {{
+    "klasa": "A",
+    "lang_target": "{worst_lang}",
+    "hypothesis": "one sentence: what is wrong and why this fix helps",
+    "proposed_config": {{
+      "param": "early_stopping_threshold",
+      "current_value": 0.02,
+      "proposed_value": 0.01,
+      "rationale": "short reason"
+    }}
+  }},
+  {{
+    "klasa": "A",
+    "lang_target": "{worst_lang}",
+    "hypothesis": "second hypothesis",
+    "proposed_config": {{
+      "param": "max_iterations",
+      "current_value": 3,
+      "proposed_value": 5,
+      "rationale": "short reason"
+    }}
+  }}
+]
+Output JSON array only. No preamble. No markdown."""
 
-    # Skraćujemo insights da ne preduljimo prompt (model je mali, 3B)
-    insights_trimmed = analysis_data['insights'][:400] if analysis_data['insights'] else "none"
-    user = (f"LANG STATS (sorted worst first):\n{analysis_data['lang_stats'][:500]}\n\n"
-            f"BOSNIAN DETAIL:\n{analysis_data['bos_detail'][:300]}\n\n"
-            f"KEY INSIGHTS:\n{insights_trimmed}\n\n"
-            f"Generate 2 hypotheses for worst-performing language. JSON array only.")
+    # Skraćeni user prompt — 3B model ne treba dugački kontekst
+    insights_trimmed = analysis_data['insights'][:300] if analysis_data['insights'] else "none"
+    user = (f"LANG={worst_lang} | avg_delta={analysis_data['lang_stats'][:200]}\n"
+            f"DETAIL: {analysis_data['bos_detail'][:200]}\n"
+            f"INSIGHT: {insights_trimmed[:200]}\n"
+            f"Generate 2 hypotheses for {worst_lang}. JSON array only.")
 
     t = timer()
     raw = llm_chat(system, user, timeout=180)
@@ -180,23 +201,33 @@ Output: JSON array of 2-3 hypothesis objects. No preamble, no markdown."""
             except: pass
 
     if not hypotheses:
-        print("  [WARN] Fallback hipoteze (LLM nije dao validne)")
+        print(f"  [WARN] Fallback hipoteze za {worst_lang} (LLM nije dao validne)")
         hypotheses = [
             {
-                "klasa": "A", "lang_target": "bos",
-                "hypothesis": "bos early_stopping_threshold 0.02 prevelik za visoke baseline vrijednosti (~0.88), uzrokuje preuranjeni stop.",
+                "klasa": "A", "lang_target": worst_lang,
+                "hypothesis": f"{worst_lang} early_stopping_threshold 0.02 prevelik za visoke baseline vrijednosti, uzrokuje preuranjeni stop.",
                 "proposed_config": {"param": "early_stopping_threshold",
                                     "current_value": 0.02, "proposed_value": 0.01,
-                                    "rationale": "bos avg_baseline ~0.88, abs delta inkrementi manji nego srp"}
+                                    "rationale": f"{worst_lang} avg_baseline visok, abs delta inkrementi manji — treba finiji threshold"}
             },
             {
-                "klasa": "A", "lang_target": "bos",
-                "hypothesis": "bos max_iterations=3 nedovoljno za izlaz iz lokalnog minimuma — avg_iter=2.0 znaci da staje prerano.",
+                "klasa": "A", "lang_target": worst_lang,
+                "hypothesis": f"{worst_lang} max_iterations=3 nedovoljno za izlaz iz lokalnog minimuma.",
                 "proposed_config": {"param": "max_iterations",
                                     "current_value": 3, "proposed_value": 5,
-                                    "rationale": "bos konvergira na iter 2 s nula deltom — treba vise pokusaja"}
+                                    "rationale": f"{worst_lang} konvergira rano s nula deltom — treba više iteracija"}
             }
         ]
+
+    # ── Post-validacija: forsiraj worst_lang bez obzira na LLM output ─────────
+    fixed = 0
+    for h in hypotheses:
+        if h.get("lang_target") != worst_lang:
+            print(f"  [FIX] lang_target {h.get('lang_target')} → {worst_lang}")
+            h["lang_target"] = worst_lang
+            fixed += 1
+    if fixed:
+        print(f"  {fixed} hipoteza korigovano na {worst_lang}")
 
     print(f"\n  Generirano {len(hypotheses)} hipoteza:")
     for i, h in enumerate(hypotheses):
@@ -336,8 +367,8 @@ def decide_and_save(hyp, val_result, sid):
                      f"Hipoteza: {hypothesis[:100]}. "
                      f"Validacija avg_delta={v_delta:+.4f} vs baseline={b_delta:+.4f}.")
         new_id = psql(f"""
-            INSERT INTO sir_procedures(name, description)
-            VALUES('{proc_name.replace("'","''")}', '{proc_desc.replace("'","''")}')
+            INSERT INTO sir_procedures(name, description, steps, lang)
+            VALUES('{proc_name.replace("'","''")}', '{proc_desc.replace("'","''")}', '{{}}', '{lang}')
             RETURNING id;
         """).strip()
         print(f"  Nova procedura upisana (id={new_id})")
@@ -374,15 +405,33 @@ if __name__ == "__main__":
     print(f"  Validacija: {VALIDATION_N} uzoraka po hipotezi")
     print(f"{'='*60}")
 
+    # Privremeni baseline za display — stvarni worst_lang određuje generate()
     baseline_row = psql("""
         SELECT ROUND(AVG(delta_similarity)::numeric,4)
         FROM sir_trajectories WHERE procedure_id=5 AND lang='bos';
     """).strip()
-    baseline_delta = float(baseline_row) if baseline_row.replace('.','').replace('-','').isdigit() else 0.001
-    print(f"\nBaseline avg_delta (bos, proc=5): {baseline_delta:+.4f}")
+    baseline_display = float(baseline_row) if baseline_row.replace('.','').replace('-','').isdigit() else 0.001
+    print(f"\nBaseline avg_delta (bos, proc=5): {baseline_display:+.4f}")
 
     analysis   = analyse()
     hypotheses = generate(analysis)
+
+    # worst_lang i baseline se sada određuju iz analyse() → generate()
+    # Izvuci worst_lang iz analize za dinamički baseline
+    worst_lang_main = "bos"
+    for line in analysis['lang_stats'].split('\n'):
+        line = line.strip()
+        if '|' in line:
+            parts = [p.strip() for p in line.split('|')]
+            if parts[0] in ('srp', 'hrv', 'bos'):
+                worst_lang_main = parts[0]
+                break
+    bl_row = psql(f"""
+        SELECT ROUND(AVG(delta_similarity)::numeric,4)
+        FROM sir_trajectories WHERE procedure_id=5 AND lang='{worst_lang_main}';
+    """).strip()
+    baseline_delta = float(bl_row) if bl_row.replace('.','').replace('-','').isdigit() else 0.001
+    print(f"  Worst lang: {worst_lang_main.upper()} | baseline_delta: {baseline_delta:+.4f}")
 
     promoted_count = 0
     for i, hyp in enumerate(hypotheses):
