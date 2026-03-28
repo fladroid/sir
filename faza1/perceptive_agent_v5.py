@@ -227,25 +227,35 @@ if __name__ == "__main__":
     pri    = dec["priority_lang"]
     n      = dec["n_samples"]
 
-    # Prioritetni jezik: pre-scoring, ostatak: 1 uzorak bez scoring
+    # Prioritetni jezik: puni pre-scoring (pool=20)
+    # Sekundarni jezici: mini pre-scoring (pool=5) — prosljeđuje pre_score_sim
     all_samples = {pri: prescored_sample(pri, n, sid)}
     for lang in ["srp","hrv","bos"]:
         if lang != pri:
-            # Za sekundarne jezike: brzo uzorkovanje bez scoring (1 uzorak)
+            # v3.1: mini pre-scoring za sekundarne — pool=5, n=1
             raw = psql(f"""SELECT local_text, eng_text FROM sentence_pairs_v2
                 WHERE lang='{lang}'
                   AND array_length(string_to_array(eng_text,' '),1) BETWEEN {WORD_MIN} AND {WORD_MAX}
                   AND id NOT IN (SELECT sp.id FROM sentence_pairs_v2 sp
                       JOIN sir_trajectories st ON st.original_text=sp.eng_text WHERE sp.lang='{lang}')
-                ORDER BY RANDOM() LIMIT 1;""")
-            s = []
+                ORDER BY RANDOM() LIMIT 5;""")
+            candidates = []
             for line in raw.split('\n'):
                 line = line.strip()
                 if '|' in line:
                     p = [x.strip() for x in line.split('|')]
-                    if len(p)>=2 and p[0] and p[1]: s.append((p[0],p[1]))
+                    if len(p)>=2 and p[0] and p[1]: candidates.append((p[0],p[1]))
+            s = []
+            for local, eng in candidates:
+                if s: break  # trebamo samo 1
+                try:
+                    sim = cosine(get_embedding(eng), get_embedding(local))
+                    s.append((local, eng, sim))
+                    print(f"\n── UZORAK ({lang.upper()}, mini pre-score={sim:.3f}) ──────\n  {eng[:65]}")
+                except:
+                    s.append((local, eng))  # fallback bez sim
+                    print(f"\n── UZORAK ({lang.upper()}, bez scoring) ──────\n  {eng[:65]}")
             all_samples[lang] = s
-            if s: print(f"\n── UZORAK ({lang.upper()}, bez scoring) ─────────────────────────\n  {s[0][1][:65]}")
 
     all_results = []
     for lang, samp in all_samples.items():
