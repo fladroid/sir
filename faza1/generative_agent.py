@@ -270,7 +270,7 @@ def validate_hypothesis(hyp, baseline_delta, sid):
         try:
             sim = cosine(get_embedding(eng), get_embedding(local))
             if BASELINE_LOW <= sim <= BASELINE_HIGH:
-                samples_in_zone.append((local, eng))
+                samples_in_zone.append((local, eng, sim))  # v3.1: čuvaj pre_score_sim
                 print(f"    ✓ {sim:.3f} | {eng[:50]}")
         except: pass
 
@@ -301,10 +301,12 @@ def validate_hypothesis(hyp, baseline_delta, sid):
     sr.PROCEDURE_ID = PARENT_PROC_ID
     t_start = timer()
     results = []
-    for local, eng in samples_in_zone:
+    for item in samples_in_zone:
+        local, eng = item[0], item[1]
+        pre_score_sim = item[2] if len(item) > 2 else None
         try:
             print(f"\n    SR: {eng[:60]}...")
-            res = sr.self_refine(eng, local, lang, "eng2local", sid)
+            res = sr.self_refine(eng, local, lang, "eng2local", sid, pre_score_sim=pre_score_sim)
             results.append(res)
             print(f"    delta={res.get('delta',0):+.4f} | iter={res.get('iterations',0)} | ok={res.get('success')}")
         except Exception as e:

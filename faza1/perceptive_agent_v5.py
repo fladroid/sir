@@ -167,7 +167,7 @@ def prescored_sample(lang, n, sid):
     if len(selected) < n:
         print(f"  [WARN] Samo {len(selected)}/{n} uzoraka u zoni za {lang}")
 
-    return [(l, e) for l, e, s in selected]
+    return [(l, e, s) for l, e, s in selected]
 
 # ── Self-Refine ────────────────────────────────────────────────────────────────
 def run_refine(samples, lang, sid):
@@ -175,9 +175,15 @@ def run_refine(samples, lang, sid):
     import self_refine_v3 as sr
     sr.PROCEDURE_ID = PROCEDURE_ID
     results = []
-    for local, eng in samples:
-        print(f"\n  → SR: {eng[:60]}...")
-        results.append(sr.self_refine(eng, local, lang, "eng2local", sid))
+    for item in samples:
+        # v3.1: sample je (local, eng, pre_score_sim) ili (local, eng)
+        if len(item) == 3:
+            local, eng, pre_score_sim = item
+        else:
+            local, eng = item
+            pre_score_sim = None
+        print(f"\n  → SR: {eng[:60]}... (pre_score={pre_score_sim:.3f})" if pre_score_sim else f"\n  → SR: {eng[:60]}...")
+        results.append(sr.self_refine(eng, local, lang, "eng2local", sid, pre_score_sim=pre_score_sim))
     return results
 
 # ── Opservacija ────────────────────────────────────────────────────────────────

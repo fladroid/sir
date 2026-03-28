@@ -29,6 +29,9 @@ PROCEDURE_ID    = 1
 MAX_ITERATIONS  = 3
 CONV_THRESHOLD  = 0.02
 
+# v3.1: lang-specific max iterations — bos halucinira u iter 2+
+LANG_MAX_ITER   = {"bos": 2, "hrv": 3, "srp": 3}
+
 LANG_NAMES = {
     "srp": "Serbian",
     "hrv": "Croatian",
@@ -166,7 +169,7 @@ def save_metadata(session_id, lang, metric, value, details=None):
              VALUES ('{session_id}','{lang}','{metric}',{value},'{dj}'::jsonb);""")
 
 # ── Self-Refine petlja ─────────────────────────────────────────────────────────
-def self_refine(original, reference, lang, direction, session_id):
+def self_refine(original, reference, lang, direction, session_id, pre_score_sim=None):
     t_total     = timer()
     target_lang = LANG_NAMES.get(lang, lang)
 
@@ -180,8 +183,11 @@ def self_refine(original, reference, lang, direction, session_id):
     critique  = ""
     prev_sim  = 0.0
     stop_reason = None
+    best_sim    = 0.0   # v3.1: best_so_far
+    best_step   = None
 
-    for i in range(1, MAX_ITERATIONS + 1):
+    lang_max_iter = LANG_MAX_ITER.get(lang, MAX_ITERATIONS)  # v3.1
+    for i in range(1, lang_max_iter + 1):
         t_iter = timer()
         print(f"\n  [Iter {i}]")
 
@@ -226,20 +232,29 @@ def self_refine(original, reference, lang, direction, session_id):
 
         steps_log.append(step)
         prev_sim = sim
+        # v3.1: update best_so_far
+        if sim > best_sim:
+            best_sim  = sim
+            best_step = step
 
     # Ako nema validnih koraka
     if not steps_log or all(s.get("lang_fail") for s in steps_log):
         print(f"  ✗ Sve iteracije invalid — preskačem trajektoriju")
         return None
 
-    # Uzmi zadnji korak s validnim similarity
+    # v3.1: uzmi best_so_far, ne zadnji korak
     valid_steps = [s for s in steps_log if "similarity" in s and not s.get("lang_fail")]
     if not valid_steps:
         return None
 
-    final_sim    = valid_steps[-1]["similarity"]
-    baseline_sim = valid_steps[0]["similarity"]
+    best_valid   = best_step if (best_step and best_step in valid_steps) else valid_steps[-1]
+    final_sim    = best_valid["similarity"]
+    # v3.1: koristiti pre_score_sim ako je dat (pravi baseline iz pre-scoring faze)
+    #        inace fallback na prvu iteraciju (staro ponašanje)
+    baseline_sim = pre_score_sim if pre_score_sim is not None else valid_steps[0]["similarity"]
     success      = final_sim > baseline_sim
+    if best_valid != valid_steps[-1]:
+        print(f"  best_so_far: iter {best_valid['iteration']} (sim={final_sim:.4f}) umjesto zadnjeg")
 
     t = timer()
     traj_id = save_trajectory(lang, direction, original, len(valid_steps),
